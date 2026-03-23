@@ -18,13 +18,31 @@ except Exception:
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+def get_runtime_secret(name: str) -> Optional[str]:
+    """Fetch secrets from Streamlit Cloud first, then local env."""
+    try:
+        value = st.secrets.get(name)  # type: ignore[attr-defined]
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(name)
+
+
+GEMINI_API_KEY = get_runtime_secret("GEMINI_API_KEY")
+MISTRAL_API_KEY = get_runtime_secret("MISTRAL_API_KEY")
+GEMINI_API_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    if GEMINI_API_KEY
+    else None
+)
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 
 # --- MISTRAL GPU MODEL CONFIGURATION ---
 MISTRAL_MODEL_PATH = "model/mistral-7b-instruct-v0.2.Q5_K_M.gguf" 
 LLM_KWARGS = {'n_ctx': 4096, 'n_threads': 4, 'n_gpu_layers': 999, 'verbose': True}
+MISTRAL_LOCAL_AVAILABLE = LLAMA_CPP_AVAILABLE and os.path.exists(MISTRAL_MODEL_PATH)
 # --- END CONFIGURATION ---
 
 # --- UTILITY FUNCTION DEFINITIONS ---
@@ -68,6 +86,13 @@ def load_mistral_model_gpu() -> Optional[Any]:
 # --- GEMINI API FUNCTION ---
 def generate_gemini_response(prompt: str) -> Tuple[str, int, float]:
     """Generates response from Gemini 1.5 Flash model."""
+    if not GEMINI_API_KEY or not GEMINI_API_URL:
+        return (
+            "⚠️ Gemini API key is missing. Add GEMINI_API_KEY in Streamlit App Settings -> Secrets.",
+            0,
+            0,
+        )
+
     system_instruction = (
         "You are HealthMate, a concise, professional, and friendly health advisor. "
         "Answer based on health data in 2–4 sentences. Avoid filler or conversational tone."
@@ -109,6 +134,58 @@ def generate_gemini_response(prompt: str) -> Tuple[str, int, float]:
         return f"⚠️ Gemini API error: {str(e)}", 0, 0
 
 
+def generate_mistral_api_response(prompt: str) -> Tuple[str, int, float]:
+    """Generates response from Mistral hosted API (cloud-friendly)."""
+    if not MISTRAL_API_KEY:
+        return (
+            "⚠️ Mistral API key is missing. Add MISTRAL_API_KEY in Streamlit App Settings -> Secrets.",
+            0,
+            0,
+        )
+
+    payload = {
+        "model": "mistral-small-latest",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are HealthMate, a concise, professional, and friendly health advisor. "
+                    "Answer based on health data in 2-4 sentences. Avoid filler."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 350,
+    }
+
+    start_time = time.time()
+    try:
+        response = requests.post(
+            MISTRAL_API_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {MISTRAL_API_KEY}",
+            },
+            json=payload,
+            timeout=45,
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        text = (
+            result.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        latency = time.time() - start_time
+        token_count = len(text.split()) if text else 0
+        return text, token_count, latency
+
+    except Exception as e:
+        return f"⚠️ Mistral API error: {str(e)}", 0, 0
+
+
 # --- STREAMLIT APP LOGIC & UI ---
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -118,6 +195,36 @@ if 'current_model' not in st.session_state:
     st.session_state.current_model = 'GEMINI (API)'
 
 st.set_page_config(page_title="HealthMate - Comparison Testbed", layout="centered")
+st.markdown(
+    """
+    <style>
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #14213d 0%, #1f2a44 100%);
+        border-right: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
+        color: #f7f7f7;
+    }
+    [data-testid="stSidebar"] .metric-card {
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 12px;
+        padding: 10px 12px;
+        margin-bottom: 8px;
+    }
+    [data-testid="stSidebar"] .tip-card {
+        background: rgba(255, 255, 255, 0.06);
+        border-left: 4px solid #fca311;
+        border-radius: 10px;
+        padding: 10px 12px;
+        margin-top: 6px;
+        color: #e6edf8;
+        font-size: 0.95rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.markdown("## 🧠 HealthMate - Model Comparison Testbed")
 st.markdown("---")
 
@@ -126,7 +233,9 @@ col1, col2 = st.columns(2)
 
 with col1:
     model_options = ['GEMINI (API)']
-    if LLAMA_CPP_AVAILABLE and os.path.exists(MISTRAL_MODEL_PATH):
+    if MISTRAL_API_KEY:
+        model_options.append('MISTRAL (API)')
+    if MISTRAL_LOCAL_AVAILABLE:
         model_options.append('MISTRAL (GPU)')
 
     model_selection = st.radio(
@@ -137,7 +246,9 @@ with col1:
     st.session_state.current_model = model_selection
 
 if 'MISTRAL (GPU)' not in model_options:
-    st.info("Mistral mode is hidden because local model/runtime is unavailable in this environment.")
+    st.info("Mistral GPU mode is hidden because local model/runtime is unavailable in this environment.")
+if 'MISTRAL (API)' not in model_options:
+    st.caption("Tip: add MISTRAL_API_KEY in Streamlit Secrets to enable cloud Mistral mode.")
     
 with col2:
     data_type = st.radio(
@@ -173,14 +284,22 @@ with st.sidebar:
         avg_latency = sum(latencies) / len(latencies)
         avg_tps = sum(tps_values) / len(tps_values)
         
-        st.markdown(f"**Total Interactions:** {len(st.session_state.metrics)}")
+        st.markdown(f"<div class='metric-card'><b>Total Interactions:</b> {len(st.session_state.metrics)}</div>", unsafe_allow_html=True)
         st.metric(label="Avg Latency", value=f"{avg_latency:.2f} s")
         st.metric(label="Avg Tokens/s", value=f"{avg_tps:.2f} t/s")
     else:
-        st.info("Ask a query to start calculating metrics.")
+        st.markdown("<div class='tip-card'>Ask a query to start calculating metrics.</div>", unsafe_allow_html=True)
+
+    st.header("🔐 API Status")
+    st.write(f"Gemini key: {'Loaded' if GEMINI_API_KEY else 'Missing'}")
+    st.write(f"Mistral API key: {'Loaded' if MISTRAL_API_KEY else 'Missing'}")
+    st.write(f"Mistral local model: {'Available' if MISTRAL_LOCAL_AVAILABLE else 'Not available'}")
         
     st.header("ℹ️ Tips")
-    st.info("Remember to re-run your 10 standard queries for each of the 8 scenarios.")
+    st.markdown(
+        "<div class='tip-card'>Remember to re-run your 10 standard queries for each scenario.</div>",
+        unsafe_allow_html=True,
+    )
 
 
 # User Input and Chat Handling
@@ -211,6 +330,9 @@ if user_input:
         try:
             if st.session_state.current_model == 'GEMINI (API)':
                 bot_reply, generated_tokens, inference_latency = generate_gemini_response(prompt)
+
+            elif st.session_state.current_model == 'MISTRAL (API)':
+                bot_reply, generated_tokens, inference_latency = generate_mistral_api_response(prompt)
                 
             elif st.session_state.current_model == 'MISTRAL (GPU)':
                 mistral_llm_instance = load_mistral_model_gpu()
