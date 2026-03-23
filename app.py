@@ -3,12 +3,19 @@ import streamlit as st
 import requests
 import json
 import time 
-from llama_cpp import Llama 
 from utils.prompt_builder import build_prompt
 from utils.data_lookup import search_relevant_facts
 import pandas as pd
 from typing import Tuple, Dict, Any, Optional
 from dotenv import load_dotenv
+
+try:
+    from llama_cpp import Llama
+    LLAMA_CPP_AVAILABLE = True
+except Exception:
+    Llama = Any  # type: ignore
+    LLAMA_CPP_AVAILABLE = False
+
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -30,11 +37,15 @@ def clean_input(text: str) -> str:
 
 # --- DUAL MODEL INITIALIZATION (FIXED) ---
 @st.cache_resource
-def load_mistral_model_gpu() -> Optional[Llama]:
+def load_mistral_model_gpu() -> Optional[Any]:
     """
     Loads Mistral onto GPU using llama_cpp.
     Correctly checks for file existence before attempting to load.
     """
+    if not LLAMA_CPP_AVAILABLE:
+        st.error("Mistral backend unavailable: 'llama_cpp' is not installed in this environment.")
+        return None
+
     # 1. Check if the file path exists.
     if not os.path.exists(MISTRAL_MODEL_PATH):
         st.error(f"Mistral Model Missing! File expected at '{MISTRAL_MODEL_PATH}' was not found.")
@@ -114,12 +125,19 @@ st.markdown("---")
 col1, col2 = st.columns(2)
 
 with col1:
+    model_options = ['GEMINI (API)']
+    if LLAMA_CPP_AVAILABLE and os.path.exists(MISTRAL_MODEL_PATH):
+        model_options.append('MISTRAL (GPU)')
+
     model_selection = st.radio(
         "Select Model for Testing:",
-        ('GEMINI (API)', 'MISTRAL (GPU)'),
+        model_options,
         key='model_selector'
     )
     st.session_state.current_model = model_selection
+
+if 'MISTRAL (GPU)' not in model_options:
+    st.info("Mistral mode is hidden because local model/runtime is unavailable in this environment.")
     
 with col2:
     data_type = st.radio(
